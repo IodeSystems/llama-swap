@@ -30,6 +30,7 @@ type Server struct {
 	perf     *perf.Monitor
 	inflight *inflightCounter
 	metrics  *metricsMonitor
+	sched    *scheduler
 	build    BuildInfo
 
 	local router.LocalRouter
@@ -125,6 +126,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		perf:        perfMon,
 		inflight:    &inflightCounter{},
 		metrics:     newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer),
+		sched:       newSchedulerIfEnabled(cfg),
 		build:       build,
 		local:       local,
 		peer:        peer,
@@ -180,9 +182,13 @@ func (s *Server) routes() {
 	// bodies and formFilterMW rewrites multipart bodies; each is a no-op for the
 	// other's Content-Type. Both run before the metrics middleware so it buffers
 	// the rewritten body.
+	// callerMW captures the caller id (API key) into the context before authMW
+	// strips the auth headers, so the scheduler can resolve caller priority and
+	// the activity log can attribute the request.
 	modelChain := chain.New(
+		CreateCallerMiddleware(),
 		authMW,
-		CreateConcurrencyMiddleware(s.cfg),
+		CreateConcurrencyMiddleware(s.cfg, s.sched, s.proxylog, s.metrics),
 		filterMW,
 		formFilterMW,
 		CreateInflightMiddleware(s.inflight),
