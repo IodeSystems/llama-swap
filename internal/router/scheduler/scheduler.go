@@ -15,13 +15,15 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 // ErrModelNotFound is granted to callers whose model is not handled by this
-// router. The router package aliases it so SendError can match it.
-var ErrModelNotFound = fmt.Errorf("local model not found")
+// router. It is an alias for shared.ErrNoLocalModelFound.
+var ErrModelNotFound = shared.ErrNoLocalModelFound
 
 // Swapper is the eviction policy: it decides which running models must be
 // stopped before a target can serve. It is orthogonal to the scheduling
@@ -47,6 +49,11 @@ type Swapper interface {
 type Scheduler interface {
 	// OnRequest handles one incoming ServeHTTP request.
 	OnRequest(req HandlerReq)
+	// OnCancel handles a request whose client has disconnected before it was
+	// granted. The scheduler must remove the request from its queue and from
+	// any in-flight swap's waiters so it never triggers a model load or grant
+	// for a caller that is no longer there.
+	OnCancel(req HandlerReq)
 	// OnSwapDone handles a swap goroutine reporting completion.
 	OnSwapDone(ev SwapDone)
 	// OnServeDone handles a tracked ServeHTTP finishing (in-flight decrement).
@@ -80,21 +87,53 @@ type Effects interface {
 	// whether the caller was still there to receive it. The scheduler bumps
 	// its in-flight count only when this returns true.
 	GrantServe(req HandlerReq, modelID string) bool
+	// GrantServeUntracked hands a caller the handler for modelID without the
+	// in-flight tracking wrapper, so the request does not count against the
+	// model's concurrency limit or service-time stats. Used for ungated
+	// (non-inference) requests. Reports whether the caller received it.
+	GrantServeUntracked(req HandlerReq, modelID string) bool
 	// StopProcesses stops the named processes in parallel and blocks until all
 	// have stopped. Unknown IDs are skipped.
 	StopProcesses(timeout time.Duration, ids []string)
 }
 
-// Factory builds a Scheduler bound to a baseRouter's Effects. The concrete
-// router captures its Swapper in the closure it passes as a Factory.
-type Factory func(name string, logger *logmon.Monitor, eff Effects) Scheduler
+// New returns a Scheduler selected by conf.Routing.Scheduler.Use, configured
+// from conf and bound to the given planner and effects. "fifo" (the default)
+// and "fairshare" are supported.
+func New(conf config.Config, name string, logger *logmon.Monitor, planner Swapper, eff Effects) (Scheduler, error) {
+	use := conf.Routing.Scheduler.Use
+	if use == "" {
+		use = "fifo"
+	}
+	switch use {
+	case "fifo":
+		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff), nil
+	case "fairshare":
+		limits := make(map[string]int, len(conf.Models))
+		for id, mc := range conf.Models {
+			limits[id] = mc.ConcurrencyLimit // 0 -> fairshare default
+		}
+		return NewFairShare(name, logger, planner, conf.Routing.Scheduler.Settings.FairShare, limits, eff), nil
+	default:
+		return nil, fmt.Errorf("unsupported scheduler type: %q", use)
+	}
+}
 
 // HandlerReq is one in-flight ServeHTTP request waiting for a routing decision.
 type HandlerReq struct {
-	Model      string
-	Ctx        context.Context
-	Respond    chan HandlerResp
-	PositionCh chan int
+	Model string
+	// Path is the request's model-relative URL path (e.g. "/v1/chat/completions"
+	// or, for an /upstream/<model>/ request, the path after the prefix strip).
+	// The fairshare scheduler matches it against its gatedPaths regex to decide
+	// whether the request consumes a concurrency slot.
+	Path string
+	// Interactive marks a request from an interactive browser UI. The fairshare
+	// scheduler admits interactive requests ahead of all non-interactive ones for
+	// the same model (a hard tier above the priority/weight ordering).
+	Interactive bool
+	Ctx         context.Context
+	Respond     chan HandlerResp
+	PositionCh  chan int
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

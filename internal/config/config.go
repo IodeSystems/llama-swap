@@ -176,8 +176,36 @@ type SchedulerConfig struct {
 	Settings SchedulerSettings `yaml:"settings"`
 }
 
+// ActivityPriorityFor returns the configured priority for a request and a label
+// for how that number is interpreted: "priority" (fairshare absolute mode),
+// "weight" (fairshare proportion mode), or "" when the active scheduler does
+// not prioritize. Used by the activity log to surface scheduler intent.
+func (s SchedulerConfig) ActivityPriorityFor(callerID, modelID string) (int, string) {
+	if s.Use != "fairshare" {
+		return 0, ""
+	}
+	fs := s.Settings.FairShare
+	mode := "priority"
+	if fs.ResolvedMode() == ModeProportion {
+		mode = "weight"
+	}
+	return fs.PriorityFor(callerID, modelID), mode
+}
+
+// InteractiveRequest reports whether a request with the given Sec-Fetch-Mode and
+// Origin header values should be treated as interactive (admitted ahead of batch
+// traffic). Only the fairshare scheduler distinguishes interactive requests;
+// other schedulers always return false.
+func (s SchedulerConfig) InteractiveRequest(secFetchMode, origin string) bool {
+	if s.Use != "fairshare" {
+		return false
+	}
+	return s.Settings.FairShare.Interactive(secFetchMode, origin)
+}
+
 type SchedulerSettings struct {
-	Fifo FifoConfig `yaml:"fifo"`
+	Fifo      FifoConfig      `yaml:"fifo"`
+	FairShare FairShareConfig `yaml:"fairshare"`
 }
 
 type FifoConfig struct {
@@ -447,6 +475,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			}
 		}
 
+		if err = modelConfig.Capabilities.Validate(); err != nil {
+			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
+
 		// Validate SetParamsByID keys and values
 		for key, paramMap := range modelConfig.Filters.SetParamsByID {
 			if matches := macroPatternRegex.FindAllStringSubmatch(key, -1); len(matches) > 0 {
@@ -561,13 +593,26 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.Routing.Scheduler.Use == "" {
 		config.Routing.Scheduler.Use = "fifo"
 	}
-	if config.Routing.Scheduler.Use != "fifo" {
-		return Config{}, fmt.Errorf("routing.scheduler.use: unknown scheduler %q (valid: fifo)", config.Routing.Scheduler.Use)
-	}
-	for modelID := range config.Routing.Scheduler.Settings.Fifo.Priority {
-		if _, found := config.RealModelName(modelID); !found {
-			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.priority references unknown model %q", modelID)
+	switch config.Routing.Scheduler.Use {
+	case "fifo":
+		for modelID := range config.Routing.Scheduler.Settings.Fifo.Priority {
+			if _, found := config.RealModelName(modelID); !found {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.priority references unknown model %q", modelID)
+			}
 		}
+	case "fairshare":
+		fs := &config.Routing.Scheduler.Settings.FairShare
+		fs.applyDefaults()
+		if err := fs.Validate(); err != nil {
+			return Config{}, fmt.Errorf("routing.scheduler.settings.fairshare: %w", err)
+		}
+		for modelID := range fs.ModelPriorities {
+			if _, found := config.RealModelName(modelID); !found {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fairshare.modelPriorities references unknown model %q", modelID)
+			}
+		}
+	default:
+		return Config{}, fmt.Errorf("routing.scheduler.use: unknown scheduler %q (valid: fifo, fairshare)", config.Routing.Scheduler.Use)
 	}
 
 	// Clean up hooks preload

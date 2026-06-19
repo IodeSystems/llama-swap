@@ -12,6 +12,7 @@ import type {
 import { connectionState } from "./theme";
 
 const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
+const ACTIVITY_LIMIT = 1000; /* cap in-memory activity entries; matches the server metrics ring */
 
 // Stores
 export const models = writable<Model[]>([]);
@@ -92,7 +93,7 @@ export function enableAPIEvents(enabled: boolean): void {
 
           case "metrics": {
             const newMetrics = JSON.parse(message.data) as ActivityLogEntry[];
-            metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics]);
+            metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics].slice(0, ACTIVITY_LIMIT));
             break;
           }
           case "inflight": {
@@ -176,15 +177,19 @@ export async function unloadSingleModel(model: string): Promise<void> {
   }
 }
 
-export async function loadModel(model: string): Promise<void> {
+export async function loadModel(model: string, signal?: AbortSignal): Promise<void> {
   try {
-    const response = await fetch(`/upstream/${model}/`, {
+    const response = await fetch(`/upstream/${model}/?_=${Date.now()}`, {
       method: "GET",
+      signal,
     });
     if (!response.ok) {
       throw new Error(`Failed to load model: ${response.status}`);
     }
   } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return;
+    }
     console.error("Failed to load model:", error);
     throw error;
   }

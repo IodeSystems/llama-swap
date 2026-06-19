@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,8 @@ import (
 // TokenMetrics holds token usage and performance metrics.
 type TokenMetrics struct {
 	CachedTokens    int     `json:"cache_tokens"`
+	DraftTokens     int     `json:"draft_tokens"`
+	DraftAccTokens  int     `json:"draft_acc_tokens"`
 	InputTokens     int     `json:"input_tokens"`
 	OutputTokens    int     `json:"output_tokens"`
 	PromptPerSecond float64 `json:"prompt_per_second"`
@@ -33,15 +36,22 @@ type TokenMetrics struct {
 
 // ActivityLogEntry represents parsed token statistics from llama-server logs.
 type ActivityLogEntry struct {
-	ID              int          `json:"id"`
-	Timestamp       time.Time    `json:"timestamp"`
-	Model           string       `json:"model"`
-	ReqPath         string       `json:"req_path"`
-	RespContentType string       `json:"resp_content_type"`
-	RespStatusCode  int          `json:"resp_status_code"`
-	Tokens          TokenMetrics `json:"tokens"`
-	DurationMs      int          `json:"duration_ms"`
-	HasCapture      bool         `json:"has_capture"`
+	ID              int               `json:"id"`
+	Timestamp       time.Time         `json:"timestamp"`
+	Model           string            `json:"model"`
+	Caller          string            `json:"caller"`
+	ReqPath         string            `json:"req_path"`
+	RespContentType string            `json:"resp_content_type"`
+	RespStatusCode  int               `json:"resp_status_code"`
+	Tokens          TokenMetrics      `json:"tokens"`
+	DurationMs      int               `json:"duration_ms"`
+	HasCapture      bool              `json:"has_capture"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	// Priority is the scheduler's configured priority/weight for this request;
+	// PriorityMode names it ("priority", "weight", or "" when the scheduler does
+	// not prioritize). Both come from the active scheduler config.
+	Priority     int    `json:"priority"`
+	PriorityMode string `json:"priority_mode"`
 }
 
 // ActivityLogEvent carries a single activity log entry to event subscribers.
@@ -125,14 +135,40 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 // When captures are enabled, a zstd+CBOR capture is stored for successful
 // requests, with cf controlling which request/response parts are retained.
 // reqBody and reqHeaders are the request data buffered before dispatch.
-func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+//
+// maskCaller renders a caller id for the activity log without leaking the raw
+// API key: "" becomes "anonymous", a short value passes through (too short to
+// be a secret), and anything longer is reduced to a 5-char prefix plus its
+// length (e.g. "sk-ragtag" -> "sk-ra…9") so distinct callers stay
+// distinguishable without exposing the key.
+func maskCaller(caller string) string {
+	if caller == "" {
+		return "anonymous"
+	}
+	if len(caller) <= 5 {
+		return caller
+	}
+	return caller[:5] + "…" + strconv.Itoa(len(caller))
+}
+
+func (mp *metricsMonitor) record(modelID, caller string, priority int, priorityMode string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
 	tm := ActivityLogEntry{
 		Timestamp:       time.Now(),
 		Model:           modelID,
+		Caller:          maskCaller(caller),
+		Priority:        priority,
+		PriorityMode:    priorityMode,
 		ReqPath:         r.URL.Path,
 		RespContentType: recorder.Header().Get("Content-Type"),
 		RespStatusCode:  recorder.Status(),
 		DurationMs:      int(time.Since(recorder.StartTime()).Milliseconds()),
+	}
+
+	if ctxData, ok := shared.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
+		tm.Metadata = make(map[string]string, len(ctxData.Metadata))
+		for k, v := range ctxData.Metadata {
+			tm.Metadata[k] = v
+		}
 	}
 
 	queueAndEmit := func() {
@@ -337,6 +373,8 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
 	promptPerSecond := -1.0
+	draftTokens := -1
+	draftAccTokens := -1
 
 	if timings.Exists() {
 		inputTokens = timings.Get("prompt_n").Int()
@@ -350,6 +388,10 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		if cachedValue := timings.Get("cache_n"); cachedValue.Exists() {
 			cachedTokens = cachedValue.Int()
 		}
+		if timings.Get("draft_n").Exists() && timings.Get("draft_n_accepted").Exists() {
+			draftTokens = int(timings.Get("draft_n").Int())
+			draftAccTokens = int(timings.Get("draft_n_accepted").Int())
+		}
 	}
 
 	return ActivityLogEntry{
@@ -357,6 +399,8 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		Model:     modelID,
 		Tokens: TokenMetrics{
 			CachedTokens:    int(cachedTokens),
+			DraftTokens:     draftTokens,
+			DraftAccTokens:  draftAccTokens,
 			InputTokens:     int(inputTokens),
 			OutputTokens:    int(outputTokens),
 			PromptPerSecond: promptPerSecond,
